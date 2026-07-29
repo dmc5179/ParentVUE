@@ -63,7 +63,7 @@ class SynergyClient:
             else "ProcessWebServiceRequest"
         )
         result_tag = f"ws:{action}Result"
-        result_el = root.find(f".//soap:Body/ws:{action}/{result_tag}", ns)
+        result_el = root.find(f".//soap:Body/ws:{action}Response/{result_tag}", ns)
 
         if result_el is None or not result_el.text:
             fault = root.find(".//soap:Body/soap:Fault/soap:Reason/soap:Text", ns)
@@ -81,16 +81,18 @@ class SynergyClient:
         children = []
         for child in xml.iter("Child"):
             children.append({
-                "name": child.get("ChildName", ""),
+                "name": child.get("ChildName", child.get("ChildFirstName", "")),
                 "id": child.get("AccessGU", ""),
+                "student_gu": child.get("StudentGU", ""),
                 "perm_id": child.get("ChildPermID", ""),
                 "grade": child.get("Grade", ""),
                 "school": child.get("OrganizationName", ""),
             })
         if not children and xml.tag == "Child":
             children.append({
-                "name": xml.get("ChildName", ""),
+                "name": xml.get("ChildName", xml.get("ChildFirstName", "")),
                 "id": xml.get("AccessGU", ""),
+                "student_gu": xml.get("StudentGU", ""),
                 "perm_id": xml.get("ChildPermID", ""),
                 "grade": xml.get("Grade", ""),
                 "school": xml.get("OrganizationName", ""),
