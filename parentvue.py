@@ -1,148 +1,127 @@
 #!/usr/bin/env python3
-"""CLI tool to pull grades and report cards from LCPS ParentVUE (Synergy SOAP API)."""
+"""CLI tool to pull grades and report cards from LCPS ParentVUE."""
 
 import argparse
-import base64
 import getpass
-import html
+import json
 import os
 import re
 import sys
-import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 
 import requests
 
 DEFAULT_DISTRICT = "portal.lcps.org"
 
 
-class SynergyClient:
+class _FormFieldParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.fields = {}
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "input" and attrs.get("type") == "hidden":
+            name = attrs.get("name", "")
+            value = attrs.get("value", "")
+            if name:
+                self.fields[name] = value
+
+
+class ParentVUEClient:
     def __init__(self, username, password, district=DEFAULT_DISTRICT):
         self.username = username
         self.password = password
-        self.endpoint = f"https://{district}/Service/PXPCommunication.asmx"
+        self.base_url = f"https://{district}"
         self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "text/xml; charset=utf-8"})
+        self._logged_in = False
 
-    def _escape(self, text):
-        return html.escape(str(text))
-
-    def _build_envelope(self, method, params_xml="<Parms/>", multi_web=False):
-        action = (
-            "ProcessWebServiceRequestMultiWeb" if multi_web
-            else "ProcessWebServiceRequest"
-        )
-        return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                 xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-                 xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <{action} xmlns="http://edupoint.com/webservices/">
-      <userID>{self._escape(self.username)}</userID>
-      <password>{self._escape(self.password)}</password>
-      <skipLoginLog>true</skipLoginLog>
-      <parent>true</parent>
-      <webServiceHandleName>PXPWebServices</webServiceHandleName>
-      <methodName>{method}</methodName>
-      <paramStr>{self._escape(params_xml)}</paramStr>
-    </{action}>
-  </soap12:Body>
-</soap12:Envelope>"""
-
-    def _call(self, method, params_xml="<Parms/>", multi_web=False):
-        envelope = self._build_envelope(method, params_xml, multi_web)
-        resp = self.session.post(self.endpoint, data=envelope.encode("utf-8"))
+    def _login(self):
+        if self._logged_in:
+            return
+        login_url = f"{self.base_url}/PXP2_Login_Parent.aspx"
+        resp = self.session.get(login_url)
         resp.raise_for_status()
 
-        root = ET.fromstring(resp.text)
-        ns = {
-            "soap": "http://www.w3.org/2003/05/soap-envelope",
-            "ws": "http://edupoint.com/webservices/",
-        }
-        action = (
-            "ProcessWebServiceRequestMultiWeb" if multi_web
-            else "ProcessWebServiceRequest"
+        parser = _FormFieldParser()
+        parser.feed(resp.text)
+        form_data = parser.fields.copy()
+        form_data["ctl00$MainContent$username"] = self.username
+        form_data["ctl00$MainContent$password"] = self.password
+        form_data["ctl00$MainContent$Submit1"] = "Login"
+
+        resp = self.session.post(
+            login_url + "?regenerateSessionId=true",
+            data=form_data,
+            allow_redirects=True,
         )
-        result_tag = f"ws:{action}Result"
-        result_el = root.find(f".//soap:Body/ws:{action}Response/{result_tag}", ns)
-
-        if result_el is None or not result_el.text:
-            fault = root.find(".//soap:Body/soap:Fault/soap:Reason/soap:Text", ns)
-            msg = fault.text if fault is not None else resp.text[:500]
-            raise RuntimeError(f"SOAP call {method} failed: {msg}")
-
-        return ET.fromstring(result_el.text)
+        resp.raise_for_status()
+        if "PXP2_Login" in resp.url:
+            raise RuntimeError("Login failed. Check your username and password.")
+        self._logged_in = True
 
     def get_child_list(self):
-        xml = self._call(
-            "ChildList",
-            '<Parms><ChildIntID>0</ChildIntID></Parms>',
-            multi_web=True,
-        )
+        self._login()
+        resp = self.session.get(f"{self.base_url}/Home_PXP2.aspx")
+        resp.raise_for_status()
+
         children = []
-        for child in xml.iter("Child"):
+        for m in re.finditer(
+            r'"agu"\s*:\s*"(\d+)".*?"name"\s*:\s*"([^"]*)".*?'
+            r'"sisNumber"\s*:\s*"([^"]*)".*?"school"\s*:\s*"([^"]*)"',
+            resp.text,
+            re.DOTALL,
+        ):
             children.append({
-                "name": child.get("ChildName", child.get("ChildFirstName", "")),
-                "id": child.get("AccessGU", ""),
-                "student_gu": child.get("StudentGU", ""),
-                "perm_id": child.get("ChildPermID", ""),
-                "grade": child.get("Grade", ""),
-                "school": child.get("OrganizationName", ""),
-            })
-        if not children and xml.tag == "Child":
-            children.append({
-                "name": xml.get("ChildName", xml.get("ChildFirstName", "")),
-                "id": xml.get("AccessGU", ""),
-                "student_gu": xml.get("StudentGU", ""),
-                "perm_id": xml.get("ChildPermID", ""),
-                "grade": xml.get("Grade", ""),
-                "school": xml.get("OrganizationName", ""),
+                "name": m.group(2),
+                "id": m.group(1),
+                "perm_id": m.group(3),
+                "school": m.group(4),
             })
         return children
 
-    def get_gradebook(self, report_period=None):
-        if report_period is not None:
-            params = f"<Parms><ReportPeriod>{int(report_period)}</ReportPeriod></Parms>"
-        else:
-            params = "<Parms/>"
-        return self._call("Gradebook", params)
+    def list_documents(self, agu="0"):
+        self._login()
+        resp = self.session.get(
+            f"{self.base_url}/PXP2_Documents.aspx?AGU={agu}"
+        )
+        resp.raise_for_status()
 
-    def get_student_info(self):
-        return self._call("StudentInfo")
-
-    def list_report_cards(self, child_int_id=0):
-        params = f"<Parms><childIntID>{int(child_int_id)}</childIntID></Parms>"
-        xml = self._call("GetStudentDocumentInitialData", params)
-        cards = []
-        for doc in xml.iter("StudentDocumentData"):
-            doc_type = doc.get("DocumentType", "")
-            if "Report Card" not in doc_type:
+        for m in re.finditer(r'"dataSource"\s*:\s*(\[.*?\])\s*[,}]', resp.text, re.DOTALL):
+            try:
+                data = json.loads(m.group(1))
+            except json.JSONDecodeError:
                 continue
-            cards.append({
-                "name": doc.get("DocumentComment", ""),
-                "end_date": doc.get("DocumentDate", ""),
-                "document_gu": doc.get("DocumentGU", ""),
-                "doc_type": doc_type,
-            })
-        return cards
+            if not data or not isinstance(data[0], dict) or "DocumentCategory" not in data[0]:
+                continue
+            docs = []
+            for doc in data:
+                href_match = re.search(r'href="([^"]+)"', doc.get("DocumentTitle", ""))
+                title_match = re.search(r'>([^<]+)<', doc.get("DocumentTitle", ""))
+                docs.append({
+                    "name": title_match.group(1) if title_match else "",
+                    "date": doc.get("DocumentUploadDate", ""),
+                    "doc_type": doc.get("DocumentCategory", ""),
+                    "download_url": href_match.group(1) if href_match else "",
+                })
+            return docs
+        return []
 
-    def get_report_card_pdf(self, document_gu):
-        params = f"<Parms><DocumentGU>{self._escape(document_gu)}</DocumentGU></Parms>"
-        xml = self._call("GetReportCardDocumentData", params)
-        b64 = None
-        for el in xml.iter():
-            if el.tag == "Base64Code" and el.text:
-                b64 = el.text
-                break
-            if el.get("Base64Code"):
-                b64 = el.get("Base64Code")
-                break
-        if not b64:
-            doc_data = xml.find(".//DocumentData")
-            if doc_data is not None and doc_data.text:
-                b64 = doc_data.text
-        if not b64:
-            raise RuntimeError("No PDF data returned for this report card")
-        return base64.b64decode(b64)
+    def list_report_cards(self, agu="0"):
+        docs = self.list_documents(agu)
+        return [d for d in docs if "Report Card" in d["doc_type"]]
+
+    def download_document(self, download_url):
+        self._login()
+        if download_url.startswith("/"):
+            url = self.base_url + download_url
+        elif download_url.startswith("http"):
+            url = download_url
+        else:
+            url = f"{self.base_url}/{download_url}"
+        resp = self.session.get(url)
+        resp.raise_for_status()
+        return resp.content
 
 
 def resolve_student(client, student_filter):
@@ -174,7 +153,7 @@ def resolve_student(client, student_filter):
 
     print("Multiple students on this account. Use --student to pick one:")
     for c in children:
-        print(f"  {c['name']}  ID: {c['perm_id']}  Grade: {c['grade']}  School: {c['school']}")
+        print(f"  {c['name']}  ID: {c['perm_id']}  School: {c['school']}")
     sys.exit(1)
 
 
@@ -191,10 +170,10 @@ def match_quarter(period_name, quarter):
     return any(p in name for p in patterns)
 
 
-def match_year(end_date, year):
+def match_year(date_str, year):
     if year is None:
         return True
-    return str(year) in end_date
+    return str(year) in date_str
 
 
 def get_credentials():
@@ -209,123 +188,72 @@ def get_credentials():
 
 def cmd_list_students(args):
     username, password = get_credentials()
-    client = SynergyClient(username, password, args.district)
+    client = ParentVUEClient(username, password, args.district)
 
     children = client.get_child_list()
     if not children:
         print("No children found on this account.")
         return
 
-    print(f"{'Name':<30} {'ID':<12} {'Grade':<8} {'School'}")
-    print("-" * 80)
-    for c in children:
-        print(f"{c['name']:<30} {c['perm_id']:<12} {c['grade']:<8} {c['school']}")
-
-
-def cmd_grades(args):
-    username, password = get_credentials()
-    client = SynergyClient(username, password, args.district)
-
-    _student = resolve_student(client, args.student)
-    print(f"Student: {_student['name']}\n")
-
-    gb = client.get_gradebook(args.quarter)
-
-    courses_el = gb.find(".//Courses")
-    if courses_el is None:
-        print("No gradebook data returned.")
-        return
-
-    reporting_period = gb.find(".//ReportingPeriod")
-    if reporting_period is not None:
-        rp_name = reporting_period.get("GradePeriod", "")
-        start = reporting_period.get("StartDate", "")
-        end = reporting_period.get("EndDate", "")
-        print(f"Period: {rp_name}  ({start} - {end})\n")
-
-    rp_list = gb.findall(".//ReportPeriod")
-    if rp_list:
-        print("Available reporting periods:")
-        for rp in rp_list:
-            idx = rp.get("Index", "")
-            name = rp.get("GradePeriod", "")
-            start = rp.get("StartDate", "")
-            end = rp.get("EndDate", "")
-            print(f"  [{idx}] {name}  ({start} - {end})")
-        print()
-
-    print(f"{'Course':<40} {'Period':<6} {'Grade':<8} {'Score'}")
+    print(f"{'Name':<30} {'ID':<12} {'School'}")
     print("-" * 70)
-    for course in courses_el.findall("Course"):
-        name = course.get("Title", "")
-        period = course.get("Period", "")
-        marks = course.find("Marks")
-        if marks is None:
-            print(f"{name:<40} {period:<6} {'N/A':<8}")
-            continue
-        for mark in marks.findall("Mark"):
-            letter = mark.get("CalculatedScoreString", "")
-            raw = mark.get("CalculatedScoreRaw", "")
-            mark_name = mark.get("MarkName", "")
-            label = f"{name} ({mark_name})" if mark_name else name
-            print(f"{label:<40} {period:<6} {letter:<8} {raw}")
-
-    print()
-    print("Tip: use --quarter N to select a specific reporting period index.")
+    for c in children:
+        print(f"{c['name']:<30} {c['perm_id']:<12} {c['school']}")
 
 
 def cmd_list_report_cards(args):
     username, password = get_credentials()
-    client = SynergyClient(username, password, args.district)
+    client = ParentVUEClient(username, password, args.district)
 
     student = resolve_student(client, args.student)
     print(f"Student: {student['name']}\n")
 
-    periods = client.list_report_cards(child_int_id=student["id"])
-    if not periods:
+    cards = client.list_report_cards(agu=student["id"])
+    if not cards:
         print("No report cards found.")
         return
 
     print(f"{'Report Card':<50} {'Date':<14} {'Type'}")
     print("-" * 80)
-    for p in periods:
-        print(f"{p['name']:<50} {p['end_date']:<14} {p['doc_type']}")
+    for c in cards:
+        print(f"{c['name']:<50} {c['date']:<14} {c['doc_type']}")
 
 
 def cmd_report_card(args):
     username, password = get_credentials()
-    client = SynergyClient(username, password, args.district)
+    client = ParentVUEClient(username, password, args.district)
 
     student = resolve_student(client, args.student)
     print(f"Student: {student['name']}")
 
-    periods = client.list_report_cards(child_int_id=student["id"])
-    if not periods:
+    cards = client.list_report_cards(agu=student["id"])
+    if not cards:
         print("No report cards found.", file=sys.stderr)
         sys.exit(1)
 
     matches = [
-        p for p in periods
-        if match_quarter(p["name"], args.quarter)
-        and match_year(p["end_date"], args.year)
+        c for c in cards
+        if c["download_url"]
+        and match_quarter(c["name"], args.quarter)
+        and match_year(c["date"], args.year)
     ]
 
     if not matches:
         print("\nNo report cards match your criteria. Available:", file=sys.stderr)
-        for p in periods:
-            print(f"  {p['name']}  ({p['end_date']})", file=sys.stderr)
+        for c in cards:
+            print(f"  {c['name']}  ({c['date']})", file=sys.stderr)
         sys.exit(1)
 
     output_dir = args.output_dir or "."
     os.makedirs(output_dir, exist_ok=True)
 
-    for p in matches:
-        print(f"\nDownloading: {p['name']} ({p['end_date']})...")
-        pdf_data = client.get_report_card_pdf(p["document_gu"])
+    for c in matches:
+        print(f"\nDownloading: {c['name']} ({c['date']})...")
+        pdf_data = client.download_document(c["download_url"])
 
         safe_name = re.sub(r'[^\w\s-]', '', student["name"]).strip().replace(" ", "_")
-        safe_period = re.sub(r'[^\w\s-]', '', p["name"]).strip().replace(" ", "_")
-        filename = f"{safe_name}_{safe_period}_{p['end_date'].replace('/', '-')}.pdf"
+        safe_period = re.sub(r'[^\w\s-]', '', c["name"]).strip().replace(" ", "_")
+        filename = f"{safe_name}_{safe_period}_{c['date'].replace('/', '-')}.pdf"
         filepath = os.path.join(output_dir, filename)
 
         with open(filepath, "wb") as f:
@@ -350,11 +278,6 @@ def main():
 
     sub.add_parser("list-students", help="List children on the account")
 
-    p_grades = sub.add_parser("grades", help="Show current grades")
-    p_grades.add_argument("--student", help="Student name (substring) or ID")
-    p_grades.add_argument("--quarter", type=int, help="Reporting period index (0-based)")
-    p_grades.add_argument("--year", help="School year (matches against end date)")
-
     p_list_rc = sub.add_parser("list-report-cards", help="List available report cards")
     p_list_rc.add_argument("--student", help="Student name (substring) or ID")
 
@@ -368,7 +291,6 @@ def main():
 
     commands = {
         "list-students": cmd_list_students,
-        "grades": cmd_grades,
         "list-report-cards": cmd_list_report_cards,
         "report-card": cmd_report_card,
     }
@@ -379,7 +301,7 @@ def main():
         sys.exit(1)
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 503:
-            print(f"ParentVUE ({args.district}) is temporarily unavailable (maintenance). Try again later.", file=sys.stderr)
+            print(f"ParentVUE ({args.district}) is temporarily unavailable. Try again later.", file=sys.stderr)
         else:
             print(f"HTTP error from {args.district}: {e}", file=sys.stderr)
         sys.exit(1)
