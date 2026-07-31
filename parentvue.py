@@ -109,17 +109,21 @@ class SynergyClient:
     def get_student_info(self):
         return self._call("StudentInfo")
 
-    def list_report_cards(self):
-        xml = self._call("GetReportCardInitialData")
-        periods = []
-        for rp in xml.iter("ReportingPeriod"):
-            periods.append({
-                "name": rp.get("ReportingPeriodName", ""),
-                "end_date": rp.get("EndDate", ""),
-                "document_gu": rp.get("DocumentGU", ""),
-                "gu": rp.get("ReportingPeriodGU", ""),
+    def list_report_cards(self, child_int_id=0):
+        params = f"<Parms><childIntID>{int(child_int_id)}</childIntID></Parms>"
+        xml = self._call("GetStudentDocumentInitialData", params)
+        cards = []
+        for doc in xml.iter("StudentDocumentData"):
+            doc_type = doc.get("DocumentType", "")
+            if "Report Card" not in doc_type:
+                continue
+            cards.append({
+                "name": doc.get("DocumentComment", ""),
+                "end_date": doc.get("DocumentDate", ""),
+                "document_gu": doc.get("DocumentGU", ""),
+                "doc_type": doc_type,
             })
-        return periods
+        return cards
 
     def get_report_card_pdf(self, document_gu):
         params = f"<Parms><DocumentGU>{self._escape(document_gu)}</DocumentGU></Parms>"
@@ -274,56 +278,52 @@ def cmd_list_report_cards(args):
     username, password = get_credentials()
     client = SynergyClient(username, password, args.district)
 
-    if args.student:
-        _student = resolve_student(client, args.student)
-        print(f"Student: {_student['name']}\n")
+    student = resolve_student(client, args.student)
+    print(f"Student: {student['name']}\n")
 
-    periods = client.list_report_cards()
+    periods = client.list_report_cards(child_int_id=student["id"])
     if not periods:
         print("No report cards found.")
         return
 
-    print(f"{'Period':<30} {'End Date':<14} {'Available'}")
-    print("-" * 60)
+    print(f"{'Report Card':<50} {'Date':<14} {'Type'}")
+    print("-" * 80)
     for p in periods:
-        available = "Yes" if p["document_gu"] else "No"
-        print(f"{p['name']:<30} {p['end_date']:<14} {available}")
+        print(f"{p['name']:<50} {p['end_date']:<14} {p['doc_type']}")
 
 
 def cmd_report_card(args):
     username, password = get_credentials()
     client = SynergyClient(username, password, args.district)
 
-    _student = resolve_student(client, args.student)
-    print(f"Student: {_student['name']}")
+    student = resolve_student(client, args.student)
+    print(f"Student: {student['name']}")
 
-    periods = client.list_report_cards()
+    periods = client.list_report_cards(child_int_id=student["id"])
     if not periods:
         print("No report cards found.", file=sys.stderr)
         sys.exit(1)
 
     matches = [
         p for p in periods
-        if p["document_gu"]
-        and match_quarter(p["name"], args.quarter)
+        if match_quarter(p["name"], args.quarter)
         and match_year(p["end_date"], args.year)
     ]
 
     if not matches:
         print("\nNo report cards match your criteria. Available:", file=sys.stderr)
         for p in periods:
-            avail = "Ready" if p["document_gu"] else "Not available"
-            print(f"  {p['name']}  (ends {p['end_date']})  [{avail}]", file=sys.stderr)
+            print(f"  {p['name']}  ({p['end_date']})", file=sys.stderr)
         sys.exit(1)
 
     output_dir = args.output_dir or "."
     os.makedirs(output_dir, exist_ok=True)
 
     for p in matches:
-        print(f"\nDownloading: {p['name']} (ends {p['end_date']})...")
+        print(f"\nDownloading: {p['name']} ({p['end_date']})...")
         pdf_data = client.get_report_card_pdf(p["document_gu"])
 
-        safe_name = re.sub(r'[^\w\s-]', '', _student["name"]).strip().replace(" ", "_")
+        safe_name = re.sub(r'[^\w\s-]', '', student["name"]).strip().replace(" ", "_")
         safe_period = re.sub(r'[^\w\s-]', '', p["name"]).strip().replace(" ", "_")
         filename = f"{safe_name}_{safe_period}_{p['end_date'].replace('/', '-')}.pdf"
         filepath = os.path.join(output_dir, filename)
@@ -376,6 +376,12 @@ def main():
         commands[args.command](args)
     except requests.exceptions.ConnectionError:
         print(f"Could not connect to {args.district}. Check your network.", file=sys.stderr)
+        sys.exit(1)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 503:
+            print(f"ParentVUE ({args.district}) is temporarily unavailable (maintenance). Try again later.", file=sys.stderr)
+        else:
+            print(f"HTTP error from {args.district}: {e}", file=sys.stderr)
         sys.exit(1)
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
